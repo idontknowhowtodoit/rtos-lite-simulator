@@ -2,7 +2,7 @@
 #include <algorithm> // For std::sort
 #include <stdexcept> // For std::runtime_error
 
-RTOSKernel::RTOSKernel() : current_task(nullptr), next_task_id(0), next_semaphore_id(0) {
+RTOSKernel::RTOSKernel() : current_task(nullptr), next_task_id(0), next_semaphore_id(0), current_tick(0) {
     log("RTOS Kernel initialized.");
 }
 
@@ -18,6 +18,10 @@ RTOSKernel::~RTOSKernel() {
         delete sem;
     }
     semaphores.clear(); // Clear the vector after deletion
+
+    // Clear queues
+    ready_queue.clear();
+    delayed_queue.clear();
 
     log("RTOS Kernel terminated and resources freed.");
 }
@@ -48,6 +52,31 @@ void RTOSKernel::createTask(const std::string& name, int priority, std::function
         ", Name='" + new_tcb->name +
         "', Priority=" + std::to_string(new_tcb->priority));
 }
+
+// Delay the current task for 'ticks' amount of time
+void RTOSKernel::delay(unsigned long ticks) {
+    if (current_task == nullptr) {
+        log("ERROR: delay called outside of a task context.");
+        return;
+    }
+
+    current_task->state = DELAYED;
+    current_task->delay_until_tick = current_tick + ticks;
+    delayed_queue.push_back(current_task);
+
+    log("Task '" + current_task->name + "' delayed until tick " + std::to_string(current_task->delay_until_tick) + ".");
+
+    // Remove from ready queue if it was there
+    for (auto it = ready_queue.begin(); it != ready_queue.end(); ++it) {
+        if (*it == current_task) {
+            ready_queue.erase(it);
+            break;
+        }
+    }
+    current_task = nullptr; // Force a context switch
+    scheduler(); // Immediately call scheduler to pick next task
+}
+
 
 // Create a new semaphore
 int RTOSKernel::createSemaphore(const std::string& name, int initial_count) {
@@ -144,11 +173,32 @@ void RTOSKernel::semaphoreSignal(int semaphore_id) {
     }
 }
 
+// Handle tick increment and unblocking delayed tasks
+void RTOSKernel::handleTick() {
+    current_tick++;
+    log("System Tick: " + std::to_string(current_tick));
+
+    // Iterate through delayed tasks and unblock those whose delay time has expired
+    for (auto it = delayed_queue.begin(); it != delayed_queue.end(); ) {
+        if ((*it)->delay_until_tick <= current_tick) {
+            (*it)->state = READY;
+            (*it)->delay_until_tick = 0; // Reset delay info
+            ready_queue.push_back(*it); // Add to ready queue
+            log("Task '" + (*it)->name + "' un-delayed and moved to READY state.");
+            it = delayed_queue.erase(it); // Remove from delayed queue
+            sortReadyQueue(); // Re-sort ready queue
+        } else {
+            ++it;
+        }
+    }
+}
+
 // Scheduler: Selects the next task to execute
 void RTOSKernel::scheduler() {
-    // Remove any tasks that might have finished or become blocked from the front of the ready queue
-    while (!ready_queue.empty() && (ready_queue.front()->state != READY)) {
-        ready_queue.erase(ready_queue.begin()); // Remove if not ready (e.g., just blocked)
+    // Remove any tasks that might have finished or become blocked/delayed from the front of the ready queue
+    while (!ready_queue.empty() && 
+           (ready_queue.front()->state != READY)) { // Only process if truly READY
+        ready_queue.erase(ready_queue.begin()); 
         sortReadyQueue(); // Re-sort after removal
     }
 
@@ -161,8 +211,7 @@ void RTOSKernel::scheduler() {
     TCB* next_task = ready_queue.front();
 
     // Perform a context switch if no task is running, or if the current task is not the highest priority
-    // or if the current task has completed its time slice (implicitly handled by re-queuing)
-    // or if the current task became blocked and scheduler was called.
+    // or if the current task has changed state (e.g., became blocked/delayed)
     if (current_task == nullptr || current_task->state != RUNNING || current_task != next_task) {
         contextSwitch(next_task);
     } else {
@@ -173,7 +222,7 @@ void RTOSKernel::scheduler() {
 // Simulate context switching between tasks
 void RTOSKernel::contextSwitch(TCB* next_task) {
     if (current_task != nullptr && current_task->state == RUNNING) {
-        // Change state of previous task to READY if it was running and not blocked
+        // Change state of previous task to READY if it was running and not blocked/delayed
         current_task->state = READY;
         log("Context switch: '" + current_task->name + "' -> READY.");
     }
@@ -190,9 +239,10 @@ void RTOSKernel::startScheduler() {
 
     // Main simulation loop. In a real RTOS, this would be an infinite loop,
     // with scheduler called by timers/interrupts.
-    int simulation_cycles = 20; // Increased cycles to better observe semaphore behavior
-    for (int i = 0; i < simulation_cycles; ++i) {
-        log("\n--- Simulation Cycle " + std::to_string(i + 1) + " ---");
+    int simulation_max_ticks = 30; // Simulate for 30 ticks
+    for (int i = 0; i < simulation_max_ticks; ++i) {
+        handleTick(); // Increment tick and handle delayed tasks
+        log("\n--- Simulation Cycle (Tick " + std::to_string(current_tick) + ") ---");
         scheduler(); // Select the next task to run
 
         if (current_task != nullptr && current_task->state == RUNNING) {
@@ -200,7 +250,7 @@ void RTOSKernel::startScheduler() {
             log("Executing task '" + current_task->name + "'...");
             current_task->task_function(); 
             
-            // If the task is still running (didn't block itself), re-queue it
+            // If the task is still running (didn't block or delay itself), re-queue it
             // This simulates a time slice ending and the task being put back into the ready queue
             if (current_task->state == RUNNING) { 
                 // Find current_task in ready_queue (it should be at front if it was just run)
@@ -215,5 +265,5 @@ void RTOSKernel::startScheduler() {
             }
         }
     }
-    log("RTOS Scheduler terminated.");
+    log("RTOS Scheduler terminated after " + std::to_string(current_tick) + " ticks.");
 }

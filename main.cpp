@@ -49,12 +49,24 @@ void consumer_task_function(RTOSKernel* kernel_ptr, int sem_id) {
 
 // A simple background task that doesn't use semaphores
 void background_task_function() {
-    std::cout << "  [Background Task] Running independently." << std::endl;
+    std::cout << "  [Background Task] Running independently. Current Tick: " << kernel.getCurrentTick() << std::endl;
 }
+
+// Task that uses the delay function
+void delay_task_function(RTOSKernel* kernel_ptr, unsigned long delay_ticks) {
+    if (kernel_ptr->getCurrentTask() == nullptr) return; // Safety check
+
+    kernel_ptr->log("  [Delay Task] Going to delay for " + std::to_string(delay_ticks) + " ticks. Current Tick: " + std::to_string(kernel_ptr->getCurrentTick()));
+    kernel_ptr->delay(delay_ticks); // Call the kernel's delay function
+
+    // This part of the code will only execute AFTER the delay has expired
+    kernel_ptr->log("  [Delay Task] Delay finished. Resumed execution. Current Tick: " + std::to_string(kernel_ptr->getCurrentTick()));
+}
+
 
 int main() {
     // Create an RTOS Kernel instance
-    RTOSKernel kernel;
+    RTOSKernel kernel; // Make kernel non-const to pass its pointer
 
     // Create a semaphore to protect the shared_resource
     // Initial count 1 for a binary semaphore (mutex-like behavior)
@@ -65,8 +77,11 @@ int main() {
     kernel.createTask("Producer Task 1", 10, [&]() { producer_task_function(&kernel, shared_resource_semaphore_id); }); // High priority
     kernel.createTask("Consumer Task 1", 8, [&]() { consumer_task_function(&kernel, shared_resource_semaphore_id); }); // Medium-high priority
     kernel.createTask("Background Task", 5, background_task_function);                                             // Medium priority
+    kernel.createTask("Delay Task 1", 7, [&]() { delay_task_function(&kernel, 5); });                                // Medium priority, delays for 5 ticks
     kernel.createTask("Producer Task 2", 10, [&]() { producer_task_function(&kernel, shared_resource_semaphore_id); }); // High priority
     kernel.createTask("Consumer Task 2", 8, [&]() { consumer_task_function(&kernel, shared_resource_semaphore_id); }); // Medium-high priority
+    kernel.createTask("Delay Task 2", 6, [&]() { delay_task_function(&kernel, 10); });                               // Medium priority, delays for 10 ticks
+
 
     // Start the RTOS scheduler simulation
     kernel.startScheduler();
