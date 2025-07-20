@@ -9,18 +9,22 @@
 #include <list>       // For waiting queues in semaphores
 #include <algorithm>  // For std::sort
 
+// Forward declaration to avoid circular dependency
+class RTOSKernel; 
+
 // Task states
 enum TaskState {
     READY,    // Ready to run
     RUNNING,  // Currently executing
-    BLOCKED,  // Blocked (e.g., waiting for semaphore)
+    BLOCKED,  // Blocked (e.g., waiting for semaphore/mutex)
     DELAYED,  // Temporarily delayed (waiting for specific tick)
     SUSPENDED // Temporarily suspended (not fully implemented yet)
 };
 
-// --- Task Control Block (TCB) Definition ---
-// Structure to hold information about each task
-struct TCB {
+// --- Task Control Block (TCB) Class Definition ---
+// Represents a task within the RTOS
+class TCB {
+public:
     int id;                               // Unique task ID
     std::string name;                     // Task name
     TaskState state;                      // Current task state
@@ -30,27 +34,70 @@ struct TCB {
     // For semaphore implementation: points to the semaphore this task is waiting on
     int waiting_on_semaphore_id; 
 
+    // For mutex implementation: points to the mutex this task is waiting on
+    int waiting_on_mutex_id;
+    // For mutex implementation: ID of the mutex currently owned by this task
+    int owner_mutex_id; 
+
     // For delay implementation: tick count until the task should be unblocked
     unsigned long delay_until_tick; 
 
-    // Constructor for TCB
-    TCB(int _id, const std::string& _name, int _priority, std::function<void()> func)
+    // Pointer to the kernel instance to allow tasks to call kernel services (e.g., delay, semaphoreWait)
+    RTOSKernel* kernel_ptr; 
+
+    // Constructor
+    TCB(int _id, const std::string& _name, int _priority, std::function<void()> func, RTOSKernel* _kernel_ptr)
         : id(_id), name(_name), state(READY), priority(_priority), task_function(func),
-          waiting_on_semaphore_id(-1), delay_until_tick(0) {} 
+          waiting_on_semaphore_id(-1), waiting_on_mutex_id(-1), owner_mutex_id(-1), delay_until_tick(0), kernel_ptr(_kernel_ptr) {}
+
+    // Method to execute the task's function
+    void execute() {
+        if (task_function) {
+            task_function();
+        }
+    }
 };
 
-// --- Semaphore Definition ---
-// Structure to represent a basic counting semaphore
-struct Semaphore {
+// --- Semaphore Class Definition ---
+// Represents a basic counting semaphore for task synchronization
+class Semaphore {
+public:
     int id;                // Unique semaphore ID
     std::string name;      // Semaphore name
     int count;             // Current value of the semaphore
     std::list<TCB*> waiting_queue; // List of tasks waiting for this semaphore (FIFO)
 
-    // Constructor for Semaphore
+    // Constructor
     Semaphore(int _id, const std::string& _name, int initial_count)
         : id(_id), name(_name), count(initial_count) {}
+
+    // Acquire the semaphore (decrement count, block if 0)
+    bool acquire(TCB* task); // Returns true if acquired, false if blocked
+
+    // Release the semaphore (increment count, unblock a waiting task if any)
+    void release();
 };
+
+// --- Mutex Class Definition ---
+// Represents a basic binary mutex for mutual exclusion
+class Mutex {
+public:
+    int id;                 // Unique mutex ID
+    std::string name;       // Mutex name
+    TCB* owner;             // Pointer to the TCB that currently owns the mutex (nullptr if free)
+    std::list<TCB*> waiting_queue; // List of tasks waiting for this mutex (FIFO)
+
+    // Constructor
+    Mutex(int _id, const std::string& _name)
+        : id(_id), name(_name), owner(nullptr) {}
+
+    // Acquire the mutex (lock)
+    bool lock(TCB* task); // Returns true if locked, false if blocked
+
+    // Release the mutex (unlock)
+    void unlock(TCB* task);
+};
+
 
 // --- RTOS Kernel Class Definition ---
 class RTOSKernel {
@@ -67,6 +114,11 @@ public:
     void semaphoreWait(int semaphore_id);   // Task requests to acquire semaphore
     void semaphoreSignal(int semaphore_id); // Task releases semaphore
 
+    // Mutex management
+    int createMutex(const std::string& name); // Returns mutex ID
+    void mutexLock(int mutex_id);           // Task requests to lock mutex
+    void mutexUnlock(int mutex_id);         // Task releases mutex
+
     // RTOS simulation control
     void startScheduler();
 
@@ -77,7 +129,7 @@ public:
     unsigned long getCurrentTick() const { return current_tick; }
 
 protected: 
-    std::vector<TCB*> tasks;        // Vector to store all TCBs
+    std::vector<TCB*> all_tasks;    // Vector to store all TCB objects
     TCB* current_task;              // Pointer to the currently executing task
     int next_task_id;               // Next available task ID for tasks
     unsigned long current_tick;     // Current system tick count
@@ -88,8 +140,12 @@ protected:
     std::vector<TCB*> delayed_queue;
 
     // Semaphore management
-    std::vector<Semaphore*> semaphores; // Vector to store all semaphores
+    std::vector<Semaphore*> all_semaphores; // Vector to store all semaphores
     int next_semaphore_id;               // Next available semaphore ID
+
+    // Mutex management
+    std::vector<Mutex*> all_mutexes;     // Vector to store all mutexes
+    int next_mutex_id;                   // Next available mutex ID
 
     // Context switch simulation (conceptual)
     void contextSwitch(TCB* next_task);
@@ -105,6 +161,16 @@ protected:
 
     // Handle tick increment and unblocking delayed tasks
     void handleTick();
+
+    // Helper to find a TCB by ID
+    TCB* findTaskById(int id);
+    // Helper to find a Semaphore by ID
+    Semaphore* findSemaphoreById(int id);
+    // Helper to find a Mutex by ID
+    Mutex* findMutexById(int id);
+
+    // Helper to move a task from BLOCKED/DELAYED to READY state
+    void unblockTask(TCB* task);
 };
 
 #endif // RTOS_KERNEL_HPP

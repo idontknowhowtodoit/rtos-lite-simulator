@@ -3,10 +3,13 @@
 #include <chrono> // For std::chrono::milliseconds
 #include <atomic> // For std::atomic_int (to simulate shared resource)
 
-// Global (shared) resource, protected by a semaphore
-std::atomic_int shared_resource = 0;
-// We will get the semaphore ID from main() and pass it to tasks via lambda capture
+// Global (shared) resources, protected by synchronization primitives
+std::atomic_int shared_resource_sem = 0; // Protected by semaphore
+std::atomic_int shared_resource_mtx = 0; // Protected by mutex
+
+// IDs for synchronization primitives
 int shared_resource_semaphore_id = -1; 
+int shared_resource_mutex_id = -1;
 
 // --- Virtual Task Functions ---
 // These functions simulate the work done by real tasks.
@@ -18,10 +21,10 @@ void producer_task_function(RTOSKernel* kernel_ptr, int sem_id) {
     kernel_ptr->log("  [Producer Task] Attempting to acquire semaphore.");
     kernel_ptr->semaphoreWait(sem_id); // Wait for semaphore
 
-    // CRITICAL SECTION START
-    kernel_ptr->log("  [Producer Task] Acquired semaphore. Modifying shared resource...");
-    shared_resource++; // Modify shared resource
-    std::cout << "  [Producer Task] Shared resource value: " << shared_resource << std::endl;
+    // CRITICAL SECTION START (Semaphore protected)
+    kernel_ptr->log("  [Producer Task] Acquired semaphore. Modifying shared_resource_sem...");
+    shared_resource_sem++; // Modify shared resource
+    std::cout << "  [Producer Task] Shared resource (sem) value: " << shared_resource_sem << std::endl;
     // CRITICAL SECTION END
 
     kernel_ptr->semaphoreSignal(sem_id); // Release semaphore
@@ -35,21 +38,39 @@ void consumer_task_function(RTOSKernel* kernel_ptr, int sem_id) {
     kernel_ptr->log("  [Consumer Task] Attempting to acquire semaphore.");
     kernel_ptr->semaphoreWait(sem_id); // Wait for semaphore
 
-    // CRITICAL SECTION START
-    kernel_ptr->log("  [Consumer Task] Acquired semaphore. Reading/Modifying shared resource...");
-    if (shared_resource > 0) {
-        shared_resource--;
+    // CRITICAL SECTION START (Semaphore protected)
+    kernel_ptr->log("  [Consumer Task] Acquired semaphore. Reading/Modifying shared_resource_sem...");
+    if (shared_resource_sem > 0) {
+        shared_resource_sem--;
     }
-    std::cout << "  [Consumer Task] Shared resource value: " << shared_resource << std::endl;
+    std::cout << "  [Consumer Task] Shared resource (sem) value: " << shared_resource_sem << std::endl;
     // CRITICAL SECTION END
 
     kernel_ptr->semaphoreSignal(sem_id); // Release semaphore
     kernel_ptr->log("  [Consumer Task] Released semaphore.");
 }
 
-// A simple background task that doesn't use semaphores
-void background_task_function() {
-    std::cout << "  [Background Task] Running independently. Current Tick: " << kernel.getCurrentTick() << std::endl;
+// Task that acquires mutex, increments shared resource, then releases
+void mutex_access_task_function(RTOSKernel* kernel_ptr, int mtx_id, const std::string& task_name) {
+    if (kernel_ptr->getCurrentTask() == nullptr) return; // Safety check
+
+    kernel_ptr->log("  [" + task_name + "] Attempting to lock mutex.");
+    kernel_ptr->mutexLock(mtx_id); // Lock mutex
+
+    // CRITICAL SECTION START (Mutex protected)
+    kernel_ptr->log("  [" + task_name + "] Locked mutex. Modifying shared_resource_mtx...");
+    shared_resource_mtx++; // Modify shared resource
+    std::cout << "  [" + task_name + "] Shared resource (mtx) value: " << shared_resource_mtx << std::endl;
+    // CRITICAL SECTION END
+
+    kernel_ptr->mutexUnlock(mtx_id); // Unlock mutex
+    kernel_ptr->log("  [" + task_name + "] Unlocked mutex.");
+}
+
+
+// A simple background task that doesn't use synchronization primitives
+void background_task_function(RTOSKernel* kernel_ptr) {
+    std::cout << "  [Background Task] Running independently. Current Tick: " << kernel_ptr->getCurrentTick() << std::endl;
 }
 
 // Task that uses the delay function
@@ -66,18 +87,27 @@ void delay_task_function(RTOSKernel* kernel_ptr, unsigned long delay_ticks) {
 
 int main() {
     // Create an RTOS Kernel instance
-    RTOSKernel kernel; // Make kernel non-const to pass its pointer
+    RTOSKernel kernel; 
 
-    // Create a semaphore to protect the shared_resource
-    // Initial count 1 for a binary semaphore (mutex-like behavior)
+    // Create a semaphore to protect shared_resource_sem
     shared_resource_semaphore_id = kernel.createSemaphore("SharedResourceSem", 1); 
 
+    // Create a mutex to protect shared_resource_mtx
+    shared_resource_mutex_id = kernel.createMutex("SharedResourceMutex");
+
     // Create tasks with different names, priorities, and functions
-    // Pass kernel pointer and semaphore ID to task functions using lambdas
+    // Semaphore-using tasks
     kernel.createTask("Producer Task 1", 10, [&]() { producer_task_function(&kernel, shared_resource_semaphore_id); }); // High priority
     kernel.createTask("Consumer Task 1", 8, [&]() { consumer_task_function(&kernel, shared_resource_semaphore_id); }); // Medium-high priority
-    kernel.createTask("Background Task", 5, background_task_function);                                             // Medium priority
+    
+    // Mutex-using tasks
+    kernel.createTask("Mutex Task A", 9, [&]() { mutex_access_task_function(&kernel, shared_resource_mutex_id, "Mutex Task A"); }); // High priority
+    kernel.createTask("Mutex Task B", 9, [&]() { mutex_access_task_function(&kernel, shared_resource_mutex_id, "Mutex Task B"); }); // High priority
+
+    // Background and Delay tasks
+    kernel.createTask("Background Task", 5, [&]() { background_task_function(&kernel); });                         // Medium priority
     kernel.createTask("Delay Task 1", 7, [&]() { delay_task_function(&kernel, 5); });                                // Medium priority, delays for 5 ticks
+    
     kernel.createTask("Producer Task 2", 10, [&]() { producer_task_function(&kernel, shared_resource_semaphore_id); }); // High priority
     kernel.createTask("Consumer Task 2", 8, [&]() { consumer_task_function(&kernel, shared_resource_semaphore_id); }); // Medium-high priority
     kernel.createTask("Delay Task 2", 6, [&]() { delay_task_function(&kernel, 10); });                               // Medium priority, delays for 10 ticks
