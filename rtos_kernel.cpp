@@ -16,7 +16,9 @@ bool Semaphore::acquire(TCB* task) {
 
 void Semaphore::release() {
     count++;
-    // The actual unblocking of a task is handled by the RTOSKernel.
+    // The actual unblocking of a task from the waiting queue and moving it to the
+    // kernel's ready_queue will be handled by the RTOSKernel::semaphoreSignal.
+    // This separation allows the kernel to manage global task states.
 }
 
 // --- Mutex Class Implementation ---
@@ -43,38 +45,76 @@ void Mutex::unlock(TCB* task) {
     owner = nullptr; // Release ownership
     task->owner_mutex_id = -1; // Clear owner info in TCB
 
-    // The actual unblocking of a task is handled by the RTOSKernel.
+    // If there are tasks waiting, unblock the first one (FIFO)
+    if (!waiting_queue.empty()) {
+        TCB* next_owner = waiting_queue.front();
+        waiting_queue.pop_front();
+        // The kernel will handle moving this task to the ready queue and assigning ownership
+        // This separation of concerns (Mutex manages its queue, Kernel manages global queues)
+        // is a design choice.
+    }
+}
+
+// --- EventFlag Class Implementation ---
+void EventFlag::set(unsigned int flags_to_set) {
+    flags |= flags_to_set; // Set flags using bitwise OR
+}
+
+void EventFlag::clear(unsigned int flags_to_clear) {
+    flags &= ~flags_to_clear; // Clear flags using bitwise AND NOT
+}
+
+bool EventFlag::check_and_clear_flags(TCB* task) {
+    bool condition_met = false;
+    if (task->event_wait_mode == WAIT_ALL) {
+        // Check if all required flags are set
+        if ((flags & task->event_flags_to_wait_for) == task->event_flags_to_wait_for) {
+            condition_met = true;
+        }
+    } else { // WAIT_ANY
+        // Check if any of the required flags are set
+        if ((flags & task->event_flags_to_wait_for) != 0) {
+            condition_met = true;
+        }
+    }
+
+    if (condition_met) {
+        // Consume the flags if the condition is met (common RTOS behavior)
+        flags &= ~task->event_flags_to_wait_for; 
+        return true;
+    }
+    return false;
 }
 
 // --- MessageQueue Class Implementation ---
-bool MessageQueue::send(TCB* task, int message) {
-    if (messages.size() < max_size) {
-        messages.push(message);
+bool MessageQueue::send(TCB* task, const std::string& message) {
+    if (queue_data.size() < max_size) {
+        queue_data.push(message);
         return true; // Message sent
     } else {
-        // Queue is full, block the sender
-        sender_waiting_queue.push_back(task);
+        // Queue is full, block the sending task
+        send_waiting_queue.push_back(task);
         return false; // Blocked
     }
 }
 
-bool MessageQueue::receive(TCB* task, int& out_message) {
-    if (!messages.empty()) {
-        out_message = messages.front();
-        messages.pop();
+bool MessageQueue::receive(TCB* task, std::string& out_message) {
+    if (!queue_data.empty()) {
+        out_message = queue_data.front();
+        queue_data.pop();
         return true; // Message received
     } else {
-        // Queue is empty, block the receiver
-        receiver_waiting_queue.push_back(task);
+        // Queue is empty, block the receiving task
+        receive_waiting_queue.push_back(task);
         return false; // Blocked
     }
 }
 
 
 // --- RTOS Kernel Class Implementation ---
-RTOSKernel::RTOSKernel() : current_task(nullptr), next_task_id(0), 
-                           next_semaphore_id(0), next_mutex_id(0), 
-                           next_message_queue_id(0), current_tick(0) {
+RTOSKernel::RTOSKernel() : current_task(nullptr), next_task_id(0), next_semaphore_id(0), 
+                           next_mutex_id(0), next_event_flag_id(0), next_message_queue_id(0), 
+                           current_tick(0) {
     log("RTOS Kernel initialized.");
 }
 
@@ -96,6 +136,12 @@ RTOSKernel::~RTOSKernel() {
         delete mtx;
     }
     all_mutexes.clear();
+
+    // Deallocate dynamically created EventFlag objects
+    for (EventFlag* ef : all_event_flags) {
+        delete ef;
+    }
+    all_event_flags.clear();
 
     // Deallocate dynamically created MessageQueue objects
     for (MessageQueue* mq : all_message_queues) {
@@ -154,6 +200,16 @@ Mutex* RTOSKernel::findMutexById(int id) {
     return nullptr;
 }
 
+// Helper to find an EventFlag by ID
+EventFlag* RTOSKernel::findEventFlagById(int id) {
+    for (EventFlag* ef : all_event_flags) {
+        if (ef->id == id) {
+            return ef;
+        }
+    }
+    return nullptr;
+}
+
 // Helper to find a MessageQueue by ID
 MessageQueue* RTOSKernel::findMessageQueueById(int id) {
     for (MessageQueue* mq : all_message_queues) {
@@ -164,14 +220,20 @@ MessageQueue* RTOSKernel::findMessageQueueById(int id) {
     return nullptr;
 }
 
+
 // Helper to move a task from BLOCKED/DELAYED to READY state
 void RTOSKernel::unblockTask(TCB* task) {
     if (task->state == BLOCKED || task->state == DELAYED) {
         task->state = READY;
+        // Reset all waiting states
         task->waiting_on_semaphore_id = -1;
         task->waiting_on_mutex_id = -1;
-        task->waiting_on_queue_id = -1; // Clear message queue wait info
+        task->waiting_on_event_flag_id = -1;
+        task->event_flags_to_wait_for = 0;
+        task->event_wait_mode = WAIT_ANY;
+        task->waiting_on_message_queue_id = -1; // Reset message queue wait info
         task->delay_until_tick = 0;
+        
         ready_queue.push_back(task);
         log("Task '" + task->name + "' unblocked and moved to READY state.");
         sortReadyQueue();
@@ -358,6 +420,112 @@ void RTOSKernel::mutexUnlock(int mutex_id) {
     }
 }
 
+// Create a new event flag group
+int RTOSKernel::createEventFlag(const std::string& name) {
+    EventFlag* new_ef = new EventFlag(next_event_flag_id++, name);
+    all_event_flags.push_back(new_ef);
+    log("Event Flag created: ID=" + std::to_string(new_ef->id) + ", Name='" + new_ef->name + "'.");
+    return new_ef->id;
+}
+
+// Task waits for specific event flags
+bool RTOSKernel::eventFlagWait(int event_flag_id, unsigned int flags_to_wait_for, EventWaitMode mode) {
+    if (current_task == nullptr) {
+        log("ERROR: eventFlagWait called outside of a task context.");
+        return false;
+    }
+
+    EventFlag* ef = findEventFlagById(event_flag_id);
+    if (ef == nullptr) {
+        log("ERROR: Event Flag with ID " + std::to_string(event_flag_id) + " not found.");
+        return false;
+    }
+
+    log("Task '" + current_task->name + "' trying to wait for flags 0x" + std::hex + flags_to_wait_for + std::dec + 
+        " on Event Flag '" + ef->name + "' (Current: 0x" + std::hex + ef->flags + std::dec + "). Mode: " + 
+        (mode == WAIT_ALL ? "WAIT_ALL" : "WAIT_ANY"));
+
+    current_task->event_flags_to_wait_for = flags_to_wait_for;
+    current_task->event_wait_mode = mode;
+
+    if (ef->check_and_clear_flags(current_task)) {
+        log("Task '" + current_task->name + "' condition met for Event Flag '" + ef->name + "'. Flags consumed.");
+        return true; // Condition met, flags consumed
+    } else {
+        // Condition not met, block the task
+        log("Task '" + current_task->name + "' is blocked, waiting for Event Flag '" + ef->name + "'.");
+        current_task->state = BLOCKED;
+        current_task->waiting_on_event_flag_id = event_flag_id;
+        ef->waiting_queue.push_back(current_task);
+
+        // Remove from ready queue if it was there
+        for (auto it = ready_queue.begin(); it != ready_queue.end(); ++it) {
+            if (*it == current_task) {
+                ready_queue.erase(it);
+                break;
+            }
+        }
+        current_task = nullptr; // Force a context switch
+        scheduler(); // Immediately call scheduler to pick next task
+        return false; // Task blocked
+    }
+}
+
+// Set specified flags in an event flag group
+void RTOSKernel::eventFlagSet(int event_flag_id, unsigned int flags_to_set) {
+    if (current_task == nullptr) {
+        log("ERROR: eventFlagSet called outside of a task context.");
+        return;
+    }
+
+    EventFlag* ef = findEventFlagById(event_flag_id);
+    if (ef == nullptr) {
+        log("ERROR: Event Flag with ID " + std::to_string(event_flag_id) + " not found.");
+        return;
+    }
+
+    log("Task '" + current_task->name + "' setting flags 0x" + std::hex + flags_to_set + std::dec + 
+        " on Event Flag '" + ef->name + "'. Current flags: 0x" + std::hex + ef->flags + std::dec);
+    ef->set(flags_to_set);
+    log("Event Flag '" + ef->name + "' new flags: 0x" + std::hex + ef->flags + std::dec);
+
+    checkAndUnblockEventFlagWaiters(ef); // Check if any waiting tasks can now be unblocked
+}
+
+// Clear specified flags in an event flag group
+void RTOSKernel::eventFlagClear(int event_flag_id, unsigned int flags_to_clear) {
+    if (current_task == nullptr) {
+        log("ERROR: eventFlagClear called outside of a task context.");
+        return;
+    }
+
+    EventFlag* ef = findEventFlagById(event_flag_id);
+    if (ef == nullptr) {
+        log("ERROR: Event Flag with ID " + std::to_string(event_flag_id) + " not found.");
+        return;
+    }
+
+    log("Task '" + current_task->name + "' clearing flags 0x" + std::hex + flags_to_clear + std::dec + 
+        " on Event Flag '" + ef->name + "'. Current flags: 0x" + std::hex + ef->flags + std::dec);
+    ef->clear(flags_to_clear);
+    log("Event Flag '" + ef->name + "' new flags: 0x" + std::hex + ef->flags + std::dec);
+    // Clearing flags doesn't unblock tasks, so no checkAndUnblockEventFlagWaiters call here.
+}
+
+// Helper to check and unblock tasks waiting on an EventFlag
+void RTOSKernel::checkAndUnblockEventFlagWaiters(EventFlag* ef) {
+    for (auto it = ef->waiting_queue.begin(); it != ef->waiting_queue.end(); ) {
+        TCB* waiting_task = *it;
+        if (ef->check_and_clear_flags(waiting_task)) {
+            log("Event Flag '" + ef->name + "': Task '" + waiting_task->name + "' unblocked by flag condition.");
+            unblockTask(waiting_task); // Use helper to unblock
+            it = ef->waiting_queue.erase(it); // Remove from event flag's waiting queue
+        } else {
+            ++it;
+        }
+    }
+}
+
 // Create a new message queue
 int RTOSKernel::createMessageQueue(const std::string& name, size_t max_size) {
     if (max_size == 0) {
@@ -365,40 +533,39 @@ int RTOSKernel::createMessageQueue(const std::string& name, size_t max_size) {
     }
     MessageQueue* new_mq = new MessageQueue(next_message_queue_id++, name, max_size);
     all_message_queues.push_back(new_mq);
-    log("Message Queue created: ID=" + std::to_string(new_mq->id) + ", Name='" + new_mq->name + "', Max Size=" + std::to_string(new_mq->max_size) + ".");
+    log("Message Queue created: ID=" + std::to_string(new_mq->id) +
+        ", Name='" + new_mq->name + "', Max Size=" + std::to_string(new_mq->max_size));
     return new_mq->id;
 }
 
-// Task sends a message to the queue
-void RTOSKernel::messageQueueSend(int queue_id, int message) {
+// Task sends a message to a queue
+bool RTOSKernel::messageQueueSend(int mq_id, const std::string& message) {
     if (current_task == nullptr) {
         log("ERROR: messageQueueSend called outside of a task context.");
-        return;
+        return false;
     }
 
-    MessageQueue* mq = findMessageQueueById(queue_id);
+    MessageQueue* mq = findMessageQueueById(mq_id);
     if (mq == nullptr) {
-        log("ERROR: Message Queue with ID " + std::to_string(queue_id) + " not found.");
-        return;
+        log("ERROR: Message Queue with ID " + std::to_string(mq_id) + " not found.");
+        return false;
     }
 
-    log("Task '" + current_task->name + "' trying to send message " + std::to_string(message) + " to queue '" + mq->name + "'. Current size: " + std::to_string(mq->messages.size()));
+    log("Task '" + current_task->name + "' trying to send message '" + message + 
+        "' to Message Queue '" + mq->name + "'. Current size: " + std::to_string(mq->queue_data.size()));
 
-    if (mq->send(current_task, message)) { // Try to send using MessageQueue's method
-        log("Task '" + current_task->name + "' sent message " + std::to_string(message) + " to queue '" + mq->name + "'. New size: " + std::to_string(mq->messages.size()));
-        // If a receiver was waiting, unblock it
-        if (!mq->receiver_waiting_queue.empty()) {
-            TCB* unblocked_receiver = mq->receiver_waiting_queue.front();
-            mq->receiver_waiting_queue.pop_front();
-            unblockTask(unblocked_receiver);
-        }
+    if (mq->send(current_task, message)) {
+        log("Task '" + current_task->name + "' sent message '" + message + 
+            "' to Message Queue '" + mq->name + "'. New size: " + std::to_string(mq->queue_data.size()));
+        checkAndUnblockMessageQueueWaiters(mq); // Check if any receiving tasks can now be unblocked
+        return true;
     } else {
-        // Queue is full, task is blocked by MessageQueue::send
-        log("Task '" + current_task->name + "' is blocked, waiting to send to queue '" + mq->name + "'.");
+        // Queue full, task blocked
+        log("Task '" + current_task->name + "' is blocked, Message Queue '" + mq->name + "' is full.");
         current_task->state = BLOCKED;
-        current_task->waiting_on_queue_id = queue_id;
-        
-        // Remove from ready queue
+        current_task->waiting_on_message_queue_id = mq_id;
+
+        // Remove from ready queue if it was there
         for (auto it = ready_queue.begin(); it != ready_queue.end(); ++it) {
             if (*it == current_task) {
                 ready_queue.erase(it);
@@ -407,40 +574,38 @@ void RTOSKernel::messageQueueSend(int queue_id, int message) {
         }
         current_task = nullptr; // Force a context switch
         scheduler(); // Immediately call scheduler to pick next task
+        return false;
     }
 }
 
-// Task receives a message from the queue
-bool RTOSKernel::messageQueueReceive(int queue_id, int& out_message) {
+// Task receives a message from a queue
+bool RTOSKernel::messageQueueReceive(int mq_id, std::string& out_message) {
     if (current_task == nullptr) {
         log("ERROR: messageQueueReceive called outside of a task context.");
         return false;
     }
 
-    MessageQueue* mq = findMessageQueueById(queue_id);
+    MessageQueue* mq = findMessageQueueById(mq_id);
     if (mq == nullptr) {
-        log("ERROR: Message Queue with ID " + std::to_string(queue_id) + " not found.");
+        log("ERROR: Message Queue with ID " + std::to_string(mq_id) + " not found.");
         return false;
     }
 
-    log("Task '" + current_task->name + "' trying to receive message from queue '" + mq->name + "'. Current size: " + std::to_string(mq->messages.size()));
+    log("Task '" + current_task->name + "' trying to receive message from Message Queue '" + mq->name + 
+        "'. Current size: " + std::to_string(mq->queue_data.size()));
 
-    if (mq->receive(current_task, out_message)) { // Try to receive using MessageQueue's method
-        log("Task '" + current_task->name + "' received message " + std::to_string(out_message) + " from queue '" + mq->name + "'. New size: " + std::to_string(mq->messages.size()));
-        // If a sender was waiting, unblock it
-        if (!mq->sender_waiting_queue.empty()) {
-            TCB* unblocked_sender = mq->sender_waiting_queue.front();
-            mq->sender_waiting_queue.pop_front();
-            unblockTask(unblocked_sender);
-        }
+    if (mq->receive(current_task, out_message)) {
+        log("Task '" + current_task->name + "' received message '" + out_message + 
+            "' from Message Queue '" + mq->name + "'. New size: " + std::to_string(mq->queue_data.size()));
+        checkAndUnblockMessageQueueWaiters(mq); // Check if any sending tasks can now be unblocked
         return true;
     } else {
-        // Queue is empty, task is blocked by MessageQueue::receive
-        log("Task '" + current_task->name + "' is blocked, waiting to receive from queue '" + mq->name + "'.");
+        // Queue empty, task blocked
+        log("Task '" + current_task->name + "' is blocked, Message Queue '" + mq->name + "' is empty.");
         current_task->state = BLOCKED;
-        current_task->waiting_on_queue_id = queue_id;
+        current_task->waiting_on_message_queue_id = mq_id;
 
-        // Remove from ready queue
+        // Remove from ready queue if it was there
         for (auto it = ready_queue.begin(); it != ready_queue.end(); ++it) {
             if (*it == current_task) {
                 ready_queue.erase(it);
@@ -449,7 +614,38 @@ bool RTOSKernel::messageQueueReceive(int queue_id, int& out_message) {
         }
         current_task = nullptr; // Force a context switch
         scheduler(); // Immediately call scheduler to pick next task
-        return false; // Task is blocked, no message received yet
+        return false;
+    }
+}
+
+// Helper to check and unblock tasks waiting on a MessageQueue
+void RTOSKernel::checkAndUnblockMessageQueueWaiters(MessageQueue* mq) {
+    // Check tasks waiting to receive (queue was empty, now might have messages)
+    if (!mq->queue_data.empty()) {
+        for (auto it = mq->receive_waiting_queue.begin(); it != mq->receive_waiting_queue.end(); ) {
+            TCB* waiting_task = *it;
+            // Try to receive for the waiting task (this will immediately succeed and unblock)
+            std::string temp_message; // Dummy variable, actual message passed to task when it runs
+            if (mq->receive(waiting_task, temp_message)) { // This effectively just checks if it can receive
+                log("Message Queue '" + mq->name + "': Task '" + waiting_task->name + "' unblocked by new message.");
+                unblockTask(waiting_task);
+                it = mq->receive_waiting_queue.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Check tasks waiting to send (queue was full, now might have space)
+    if (mq->queue_data.size() < mq->max_size) {
+        for (auto it = mq->send_waiting_queue.begin(); it != mq->send_waiting_queue.end(); ) {
+            TCB* waiting_task = *it;
+            // We don't actually send the message here, just unblock.
+            // The task will re-attempt sending when it runs.
+            log("Message Queue '" + mq->name + "': Task '" + waiting_task->name + "' unblocked by space available.");
+            unblockTask(waiting_task);
+            it = mq->send_waiting_queue.erase(it);
+        }
     }
 }
 
@@ -516,7 +712,7 @@ void RTOSKernel::startScheduler() {
 
     // Main simulation loop. In a real RTOS, this would be an infinite loop,
     // with scheduler called by timers/interrupts.
-    int simulation_max_ticks = 30; // Simulate for 30 ticks
+    int simulation_max_ticks = 60; // Simulate for 60 ticks to see message queues in action
     for (int i = 0; i < simulation_max_ticks; ++i) {
         handleTick(); // Increment tick and handle delayed tasks
         log("\n--- Simulation Cycle (Tick " + std::to_string(current_tick) + ") ---");
@@ -530,7 +726,8 @@ void RTOSKernel::startScheduler() {
             // If the task is still running (didn't block or delay itself), re-queue it
             // This simulates a time slice ending and the task being put back into the ready queue
             if (current_task->state == RUNNING) { 
-                // Find current_task in ready_queue 
+                // Find current_task in ready_queue (it should be at front if it was just run)
+                // Use std::remove to efficiently remove and then erase
                 auto it = std::remove(ready_queue.begin(), ready_queue.end(), current_task);
                 ready_queue.erase(it, ready_queue.end());
                 
