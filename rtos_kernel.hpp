@@ -3,10 +3,10 @@
 
 #include <iostream>
 #include <vector>
-#include <queue>      // For scheduling queue
+#include <queue>      // For scheduling queue and MessageQueue data storage
 #include <functional> // For std::function
 #include <string>     // For task names
-#include <list>       // For waiting queues in semaphores
+#include <list>       // For waiting queues in semaphores/mutexes/message queues
 #include <algorithm>  // For std::sort
 
 // Forward declaration to avoid circular dependency
@@ -16,7 +16,7 @@ class RTOSKernel;
 enum TaskState {
     READY,    // Ready to run
     RUNNING,  // Currently executing
-    BLOCKED,  // Blocked (e.g., waiting for semaphore/mutex)
+    BLOCKED,  // Blocked (e.g., waiting for semaphore/mutex/message)
     DELAYED,  // Temporarily delayed (waiting for specific tick)
     SUSPENDED // Temporarily suspended (not fully implemented yet)
 };
@@ -31,15 +31,13 @@ public:
     int priority;                         // Task priority (higher value = higher priority)
     std::function<void()> task_function;  // Function to be executed by the task
     
-    // For semaphore implementation: points to the semaphore this task is waiting on
+    // For synchronization primitives
     int waiting_on_semaphore_id; 
-
-    // For mutex implementation: points to the mutex this task is waiting on
     int waiting_on_mutex_id;
-    // For mutex implementation: ID of the mutex currently owned by this task
     int owner_mutex_id; 
+    int waiting_on_queue_id; // For message queue
 
-    // For delay implementation: tick count until the task should be unblocked
+    // For delay implementation
     unsigned long delay_until_tick; 
 
     // Pointer to the kernel instance to allow tasks to call kernel services (e.g., delay, semaphoreWait)
@@ -48,7 +46,8 @@ public:
     // Constructor
     TCB(int _id, const std::string& _name, int _priority, std::function<void()> func, RTOSKernel* _kernel_ptr)
         : id(_id), name(_name), state(READY), priority(_priority), task_function(func),
-          waiting_on_semaphore_id(-1), waiting_on_mutex_id(-1), owner_mutex_id(-1), delay_until_tick(0), kernel_ptr(_kernel_ptr) {}
+          waiting_on_semaphore_id(-1), waiting_on_mutex_id(-1), owner_mutex_id(-1), 
+          waiting_on_queue_id(-1), delay_until_tick(0), kernel_ptr(_kernel_ptr) {}
 
     // Method to execute the task's function
     void execute() {
@@ -98,6 +97,28 @@ public:
     void unlock(TCB* task);
 };
 
+// --- MessageQueue Class Definition ---
+// Represents a basic message queue for inter-task communication
+class MessageQueue {
+public:
+    int id;                  // Unique message queue ID
+    std::string name;        // Message queue name
+    std::queue<int> messages; // Queue to store integer messages
+    size_t max_size;         // Maximum number of messages the queue can hold
+    std::list<TCB*> sender_waiting_queue; // Tasks blocked trying to send to full queue
+    std::list<TCB*> receiver_waiting_queue; // Tasks blocked trying to receive from empty queue
+
+    // Constructor
+    MessageQueue(int _id, const std::string& _name, size_t _max_size)
+        : id(_id), name(_name), max_size(_max_size) {}
+
+    // Send a message to the queue
+    bool send(TCB* task, int message); // Returns true if sent, false if blocked
+
+    // Receive a message from the queue
+    bool receive(TCB* task, int& out_message); // Returns true if received, false if blocked
+};
+
 
 // --- RTOS Kernel Class Definition ---
 class RTOSKernel {
@@ -109,15 +130,19 @@ public:
     void createTask(const std::string& name, int priority, std::function<void()> task_func);
     void delay(unsigned long ticks); // Delay current task for specified ticks
 
-    // Semaphore management
+    // Synchronization primitives
     int createSemaphore(const std::string& name, int initial_count); // Returns semaphore ID
     void semaphoreWait(int semaphore_id);   // Task requests to acquire semaphore
     void semaphoreSignal(int semaphore_id); // Task releases semaphore
 
-    // Mutex management
     int createMutex(const std::string& name); // Returns mutex ID
     void mutexLock(int mutex_id);           // Task requests to lock mutex
     void mutexUnlock(int mutex_id);         // Task releases mutex
+
+    // Message Queue management
+    int createMessageQueue(const std::string& name, size_t max_size); // Returns queue ID
+    void messageQueueSend(int queue_id, int message); // Task sends message to queue
+    bool messageQueueReceive(int queue_id, int& out_message); // Task receives message from queue
 
     // RTOS simulation control
     void startScheduler();
@@ -134,18 +159,20 @@ protected:
     int next_task_id;               // Next available task ID for tasks
     unsigned long current_tick;     // Current system tick count
 
-    // Ready queue for tasks (conceptually a priority queue based on current sort)
+    // Queues for task states
     std::vector<TCB*> ready_queue; 
-    // Queue for tasks currently in DELAYED state
     std::vector<TCB*> delayed_queue;
 
-    // Semaphore management
-    std::vector<Semaphore*> all_semaphores; // Vector to store all semaphores
-    int next_semaphore_id;               // Next available semaphore ID
+    // Synchronization primitives storage
+    std::vector<Semaphore*> all_semaphores; 
+    int next_semaphore_id;               
 
-    // Mutex management
-    std::vector<Mutex*> all_mutexes;     // Vector to store all mutexes
-    int next_mutex_id;                   // Next available mutex ID
+    std::vector<Mutex*> all_mutexes;     
+    int next_mutex_id;                   
+
+    std::vector<MessageQueue*> all_message_queues; // Vector to store all message queues
+    int next_message_queue_id;                   // Next available message queue ID
+
 
     // Context switch simulation (conceptual)
     void contextSwitch(TCB* next_task);
@@ -162,12 +189,11 @@ protected:
     // Handle tick increment and unblocking delayed tasks
     void handleTick();
 
-    // Helper to find a TCB by ID
+    // Helper to find objects by ID
     TCB* findTaskById(int id);
-    // Helper to find a Semaphore by ID
     Semaphore* findSemaphoreById(int id);
-    // Helper to find a Mutex by ID
     Mutex* findMutexById(int id);
+    MessageQueue* findMessageQueueById(int id);
 
     // Helper to move a task from BLOCKED/DELAYED to READY state
     void unblockTask(TCB* task);
