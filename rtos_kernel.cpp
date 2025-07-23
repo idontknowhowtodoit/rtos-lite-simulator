@@ -110,11 +110,41 @@ bool MessageQueue::receive(TCB* task, std::string& out_message) {
     }
 }
 
+// --- SoftwareTimer Class Implementation ---
+void SoftwareTimer::check_and_expire(unsigned long current_tick) {
+    if (!is_running) return;
+
+    if (current_tick >= expiry_tick) {
+        // Timer has expired
+        kernel_ptr->log("  [Timer '" + name + "' (ID:" + std::to_string(id) + ")] Expired at tick " + std::to_string(current_tick) + ".");
+
+        if (callback_function) {
+            callback_function(); // Execute the callback
+        }
+        
+        if (event_flag_id_to_set != -1) {
+            // Set event flags through the kernel
+            kernel_ptr->eventFlagSet(event_flag_id_to_set, event_flags_to_set);
+            kernel_ptr->log("  [Timer '" + name + "'] Set flags 0x" + std::hex + event_flags_to_set + std::dec + 
+                            " on Event Flag ID " + std::to_string(event_flag_id_to_set) + ".");
+        }
+
+        if (is_periodic) {
+            // For periodic timers, reschedule for the next period
+            start(current_tick); 
+            kernel_ptr->log("  [Timer '" + name + "'] Rescheduled for next expiry at tick " + std::to_string(expiry_tick) + ".");
+        } else {
+            // For one-shot timers, stop after expiry
+            stop();
+        }
+    }
+}
+
 
 // --- RTOS Kernel Class Implementation ---
 RTOSKernel::RTOSKernel() : current_task(nullptr), next_task_id(0), next_semaphore_id(0), 
                            next_mutex_id(0), next_event_flag_id(0), next_message_queue_id(0), 
-                           current_tick(0) {
+                           next_timer_id(0), current_tick(0) {
     log("RTOS Kernel initialized.");
 }
 
@@ -148,6 +178,12 @@ RTOSKernel::~RTOSKernel() {
         delete mq;
     }
     all_message_queues.clear();
+
+    // Deallocate dynamically created SoftwareTimer objects
+    for (SoftwareTimer* timer : all_timers) {
+        delete timer;
+    }
+    all_timers.clear();
 
     // Clear queues (pointers are already deleted)
     ready_queue.clear();
@@ -220,6 +256,16 @@ MessageQueue* RTOSKernel::findMessageQueueById(int id) {
     return nullptr;
 }
 
+// Helper to find a SoftwareTimer by ID
+SoftwareTimer* RTOSKernel::findTimerById(int id) {
+    for (SoftwareTimer* timer : all_timers) {
+        if (timer->id == id) {
+            return timer;
+        }
+    }
+    return nullptr;
+}
+
 
 // Helper to move a task from BLOCKED/DELAYED to READY state
 void RTOSKernel::unblockTask(TCB* task) {
@@ -231,7 +277,7 @@ void RTOSKernel::unblockTask(TCB* task) {
         task->waiting_on_event_flag_id = -1;
         task->event_flags_to_wait_for = 0;
         task->event_wait_mode = WAIT_ANY;
-        task->waiting_on_message_queue_id = -1; // Reset message queue wait info
+        task->waiting_on_message_queue_id = -1; 
         task->delay_until_tick = 0;
         
         ready_queue.push_back(task);
@@ -240,7 +286,7 @@ void RTOSKernel::unblockTask(TCB* task) {
     }
 }
 
-// Create and add a task to the kernel's task list and ready queue
+// Create and add a task to the kernel's task list and ready queue (regular task)
 void RTOSKernel::createTask(const std::string& name, int priority, std::function<void()> task_func) {
     TCB* new_tcb = new TCB(next_task_id++, name, priority, task_func, this); // Pass kernel pointer to TCB
     all_tasks.push_back(new_tcb);
@@ -252,6 +298,21 @@ void RTOSKernel::createTask(const std::string& name, int priority, std::function
         ", Name='" + new_tcb->name +
         "', Priority=" + std::to_string(new_tcb->priority));
 }
+
+// Create and add a task to the kernel's task list and ready queue (periodic task)
+void RTOSKernel::createTask(const std::string& name, int priority, std::function<void()> task_func, unsigned long period_ticks) {
+    TCB* new_tcb = new TCB(next_task_id++, name, priority, task_func, this, true, period_ticks);
+    new_tcb->next_run_tick = current_tick + period_ticks; // Set initial run time
+    all_tasks.push_back(new_tcb);
+    // Periodic tasks are not immediately added to ready_queue.
+    // They are scheduled to run by handlePeriodicTasks when their next_run_tick is reached.
+
+    log("Periodic Task created: ID=" + std::to_string(new_tcb->id) +
+        ", Name='" + new_tcb->name +
+        "', Priority=" + std::to_string(new_tcb->priority) +
+        ", Period=" + std::to_string(new_tcb->period_ticks) + " ticks. Next run at tick " + std::to_string(new_tcb->next_run_tick));
+}
+
 
 // Delay the current task for 'ticks' amount of time
 void RTOSKernel::delay(unsigned long ticks) {
@@ -474,8 +535,9 @@ bool RTOSKernel::eventFlagWait(int event_flag_id, unsigned int flags_to_wait_for
 // Set specified flags in an event flag group
 void RTOSKernel::eventFlagSet(int event_flag_id, unsigned int flags_to_set) {
     if (current_task == nullptr) {
-        log("ERROR: eventFlagSet called outside of a task context.");
-        return;
+        // This can be called from a timer callback, so current_task might be null.
+        // We log a warning but allow it.
+        // log("WARNING: eventFlagSet called outside of a task context. (Allowed for timers)");
     }
 
     EventFlag* ef = findEventFlagById(event_flag_id);
@@ -484,7 +546,8 @@ void RTOSKernel::eventFlagSet(int event_flag_id, unsigned int flags_to_set) {
         return;
     }
 
-    log("Task '" + current_task->name + "' setting flags 0x" + std::hex + flags_to_set + std::dec + 
+    std::string caller_name = (current_task != nullptr) ? current_task->name : "System/Timer";
+    log(caller_name + " setting flags 0x" + std::hex + flags_to_set + std::dec + 
         " on Event Flag '" + ef->name + "'. Current flags: 0x" + std::hex + ef->flags + std::dec);
     ef->set(flags_to_set);
     log("Event Flag '" + ef->name + "' new flags: 0x" + std::hex + ef->flags + std::dec);
@@ -649,13 +712,78 @@ void RTOSKernel::checkAndUnblockMessageQueueWaiters(MessageQueue* mq) {
     }
 }
 
+// Create a new software timer (callback-based)
+int RTOSKernel::createTimer(const std::string& name, unsigned long period_ticks, std::function<void()> callback_func) {
+    SoftwareTimer* new_timer = new SoftwareTimer(next_timer_id++, name, period_ticks, callback_func, this);
+    all_timers.push_back(new_timer);
+    log("Timer created (callback): ID=" + std::to_string(new_timer->id) +
+        ", Name='" + new_timer->name + "', Period=" + std::to_string(new_timer->period_ticks) +
+        (new_timer->is_periodic ? " (Periodic)" : " (One-shot)"));
+    return new_timer->id;
+}
+
+// Create a new software timer (event flag-based)
+int RTOSKernel::createTimer(const std::string& name, unsigned long period_ticks, int event_flag_id, unsigned int event_flags_to_set) {
+    EventFlag* ef = findEventFlagById(event_flag_id);
+    if (ef == nullptr) {
+        log("ERROR: Cannot create timer. Event Flag with ID " + std::to_string(event_flag_id) + " not found.");
+        return -1;
+    }
+    SoftwareTimer* new_timer = new SoftwareTimer(next_timer_id++, name, period_ticks, event_flag_id, event_flags_to_set, this);
+    all_timers.push_back(new_timer);
+    log("Timer created (event flag): ID=" + std::to_string(new_timer->id) +
+        ", Name='" + new_timer->name + "', Period=" + std::to_string(new_timer->period_ticks) +
+        ", Sets flags 0x" + std::hex + event_flags_to_set + std::dec + " on EF ID " + std::to_string(event_flag_id) +
+        (new_timer->is_periodic ? " (Periodic)" : " (One-shot)"));
+    return new_timer->id;
+}
+
+void RTOSKernel::startTimer(int timer_id) {
+    SoftwareTimer* timer = findTimerById(timer_id);
+    if (timer == nullptr) {
+        log("ERROR: Timer with ID " + std::to_string(timer_id) + " not found.");
+        return;
+    }
+    if (!timer->is_running) {
+        timer->start(current_tick);
+        log("Timer '" + timer->name + "' (ID:" + std::to_string(timer_id) + ") started. Expires at tick " + std::to_string(timer->expiry_tick) + ".");
+    } else {
+        log("Timer '" + timer->name + "' (ID:" + std::to_string(timer_id) + ") is already running.");
+    }
+}
+
+void RTOSKernel::stopTimer(int timer_id) {
+    SoftwareTimer* timer = findTimerById(timer_id);
+    if (timer == nullptr) {
+        log("ERROR: Timer with ID " + std::to_string(timer_id) + " not found.");
+        return;
+    }
+    if (timer->is_running) {
+        timer->stop();
+        log("Timer '" + timer->name + "' (ID:" + std::to_string(timer_id) + ") stopped.");
+    } else {
+        log("Timer '" + timer->name + "' (ID:" + std::to_string(timer_id) + ") is not running.");
+    }
+}
+
+void RTOSKernel::resetTimer(int timer_id) {
+    SoftwareTimer* timer = findTimerById(timer_id);
+    if (timer == nullptr) {
+        log("ERROR: Timer with ID " + std::to_string(timer_id) + " not found.");
+        return;
+    }
+    timer->stop(); // Stop first
+    timer->start(current_tick); // Then restart from current tick
+    log("Timer '" + timer->name + "' (ID:" + std::to_string(timer_id) + ") reset and started. Expires at tick " + std::to_string(timer->expiry_tick) + ".");
+}
+
 
 // Handle tick increment and unblocking delayed tasks
 void RTOSKernel::handleTick() {
     current_tick++;
     log("System Tick: " + std::to_string(current_tick));
 
-    // Iterate through delayed tasks and unblock those whose delay time has expired
+    // 1. Handle delayed tasks
     for (auto it = delayed_queue.begin(); it != delayed_queue.end(); ) {
         if ((*it)->delay_until_tick <= current_tick) {
             unblockTask(*it); // Use helper to unblock
@@ -664,7 +792,34 @@ void RTOSKernel::handleTick() {
             ++it;
         }
     }
+
+    // 2. Handle periodic tasks
+    handlePeriodicTasks();
+
+    // 3. Handle software timers
+    handleSoftwareTimers();
 }
+
+// Handle periodic tasks: check if their next_run_tick has arrived
+void RTOSKernel::handlePeriodicTasks() {
+    for (TCB* task : all_tasks) {
+        if (task->is_periodic && task->state != BLOCKED && task->state != DELAYED && task->state != RUNNING) {
+            if (current_tick >= task->next_run_tick) {
+                log("Periodic Task '" + task->name + "' (ID:" + std::to_string(task->id) + ") scheduled to run at tick " + std::to_string(current_tick) + ".");
+                unblockTask(task); // Move to READY state
+                task->next_run_tick = current_tick + task->period_ticks; // Schedule next run
+            }
+        }
+    }
+}
+
+// Handle software timers: check if they have expired
+void RTOSKernel::handleSoftwareTimers() {
+    for (SoftwareTimer* timer : all_timers) {
+        timer->check_and_expire(current_tick);
+    }
+}
+
 
 // Scheduler: Selects the next task to execute
 void RTOSKernel::scheduler() {
@@ -712,10 +867,10 @@ void RTOSKernel::startScheduler() {
 
     // Main simulation loop. In a real RTOS, this would be an infinite loop,
     // with scheduler called by timers/interrupts.
-    int simulation_max_ticks = 60; // Simulate for 60 ticks to see message queues in action
+    int simulation_max_ticks = 100; // Simulate for 100 ticks to see timers/periodic tasks in action
     for (int i = 0; i < simulation_max_ticks; ++i) {
-        handleTick(); // Increment tick and handle delayed tasks
         log("\n--- Simulation Cycle (Tick " + std::to_string(current_tick) + ") ---");
+        handleTick(); // Increment tick and handle delayed/periodic tasks/timers
         scheduler(); // Select the next task to run
 
         if (current_task != nullptr && current_task->state == RUNNING) {

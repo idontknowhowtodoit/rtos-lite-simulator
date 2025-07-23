@@ -7,18 +7,22 @@
 // Global (shared) resources, protected by synchronization primitives
 std::atomic_int shared_resource_sem = 0; // Protected by semaphore
 std::atomic_int shared_resource_mtx = 0; // Protected by mutex
+std::atomic_int timer_callback_count = 0; // For timer callback demo
 
 // IDs for synchronization primitives
 int shared_resource_semaphore_id = -1; 
 int shared_resource_mutex_id = -1;
 int event_flag_group_id = -1; // ID for the event flag group
 int message_queue_id = -1; // ID for the message queue
+int callback_timer_id = -1; // ID for the callback timer
+int event_timer_id = -1;    // ID for the event-setting timer
 
 // Define specific event flags as bitmasks
 const unsigned int EVENT_FLAG_A = 0x01; // Bit 0
 const unsigned int EVENT_FLAG_B = 0x02; // Bit 1
 const unsigned int EVENT_FLAG_C = 0x04; // Bit 2
 const unsigned int EVENT_FLAG_D = 0x08; // Bit 3
+const unsigned int EVENT_FLAG_TIMER_DONE = 0x10; // Bit 4 for timer event
 
 // --- Virtual Task Functions ---
 // These functions simulate the work done by real tasks.
@@ -193,6 +197,18 @@ void message_receiver_task_function(RTOSKernel* kernel_ptr, int mq_id, int num_m
     kernel_ptr->log("  [Message Receiver Task] Finished receiving messages.");
 }
 
+// A task that just executes periodically
+void periodic_task_function(RTOSKernel* kernel_ptr) {
+    if (kernel_ptr->getCurrentTask() == nullptr) return; // Safety check
+    kernel_ptr->log("  [" + kernel_ptr->getCurrentTask()->name + "] is running periodically at Tick: " + std::to_string(kernel_ptr->getCurrentTick()));
+}
+
+// Callback function for a software timer
+void my_timer_callback() {
+    timer_callback_count++;
+    std::cout << "[RTOS Log] *** Timer Callback executed! Count: " << timer_callback_count << " ***" << std::endl;
+}
+
 
 int main() {
     // Create an RTOS Kernel instance
@@ -231,11 +247,36 @@ int main() {
     kernel.createTask("MQ Sender 1", 8, [&]() { message_sender_task_function(&kernel, message_queue_id, 5, 2); }); // Send 5 messages, 2 ticks delay
     kernel.createTask("MQ Receiver 1", 8, [&]() { message_receiver_task_function(&kernel, message_queue_id, 5); }); // Receive 5 messages
 
+    // Periodic tasks
+    // Task that runs every 10 ticks
+    kernel.createTask("Periodic Task 10T", 4, [&]() { periodic_task_function(&kernel); }, 10);
+    // Task that runs every 15 ticks
+    kernel.createTask("Periodic Task 15T", 4, [&]() { periodic_task_function(&kernel); }, 15);
+
+    // Software Timers
+    // One-shot timer that calls a callback after 8 ticks
+    callback_timer_id = kernel.createTimer("Callback Timer", 8, my_timer_callback);
+    // Periodic timer that sets EVENT_FLAG_TIMER_DONE every 12 ticks
+    event_timer_id = kernel.createTimer("Event Flag Timer", 12, event_flag_group_id, EVENT_FLAG_TIMER_DONE);
+
+    // Task that waits for the event flag set by the timer
+    kernel.createTask("Timer Event Waiter", 7, [&]() { 
+        if (kernel.getCurrentTask() == nullptr) return;
+        kernel.log("  [Timer Event Waiter] Waiting for EVENT_FLAG_TIMER_DONE from timer.");
+        kernel.eventFlagWait(event_flag_group_id, EVENT_FLAG_TIMER_DONE, WAIT_ANY);
+        kernel.log("  [Timer Event Waiter] EVENT_FLAG_TIMER_DONE received! Continuing execution.");
+    });
+
+
     // Background and Delay tasks
     kernel.createTask("Background Task", 5, [&]() { background_task_function(&kernel); });                         
     kernel.createTask("Delay Task 1", 7, [&]() { delay_task_function(&kernel, 5); });                                
     kernel.createTask("Delay Task 2", 6, [&]() { delay_task_function(&kernel, 10); });                               
 
+
+    // Start some timers initially
+    kernel.startTimer(callback_timer_id);
+    kernel.startTimer(event_timer_id);
 
     // Start the RTOS scheduler simulation
     kernel.startScheduler();
