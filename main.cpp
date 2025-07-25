@@ -269,7 +269,7 @@ int main() {
 
 
     // Background and Delay tasks
-    kernel.createTask("Background Task", 5, [&]() { background_task_function(&kernel); });                         
+    // kernel.createTask("Background Task", 5, [&]() { background_task_function(&kernel); }); // Uncomment to add a general background task                         
     kernel.createTask("Delay Task 1", 7, [&]() { delay_task_function(&kernel, 5); });                                
     kernel.createTask("Delay Task 2", 6, [&]() { delay_task_function(&kernel, 10); });                               
 

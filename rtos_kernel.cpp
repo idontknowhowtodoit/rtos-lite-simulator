@@ -146,6 +146,13 @@ RTOSKernel::RTOSKernel() : current_task(nullptr), next_task_id(0), next_semaphor
                            next_mutex_id(0), next_event_flag_id(0), next_message_queue_id(0), 
                            next_timer_id(0), current_tick(0) {
     log("RTOS Kernel initialized.");
+    // Create the idle task with the lowest possible priority
+    createTask("Idle Task", 0, [&]() { 
+        // The idle task simply runs an infinite loop, doing nothing or low-priority work
+        // In a real RTOS, this might put the CPU into a low-power state.
+        // Here, it just logs its activity.
+        // std::cout << "  [Idle Task] Idling... Current Tick: " << current_tick << std::endl;
+    });
 }
 
 RTOSKernel::~RTOSKernel() {
@@ -510,7 +517,7 @@ bool RTOSKernel::eventFlagWait(int event_flag_id, unsigned int flags_to_wait_for
     current_task->event_wait_mode = mode;
 
     if (ef->check_and_clear_flags(current_task)) {
-        log("Task '" + current_task->name + "' condition met for Event Flag '" + ef->name + "'. Flags consumed.");
+        kernel_ptr->log("  Task '" + current_task->name + "' condition met for Event Flag '" + ef->name + "'. Flags consumed.");
         return true; // Condition met, flags consumed
     } else {
         // Condition not met, block the task
@@ -803,7 +810,8 @@ void RTOSKernel::handleTick() {
 // Handle periodic tasks: check if their next_run_tick has arrived
 void RTOSKernel::handlePeriodicTasks() {
     for (TCB* task : all_tasks) {
-        if (task->is_periodic && task->state != BLOCKED && task->state != DELAYED && task->state != RUNNING) {
+        // Only consider periodic tasks that are not currently blocked or delayed
+        if (task->is_periodic && task->state != BLOCKED && task->state != DELAYED) {
             if (current_tick >= task->next_run_tick) {
                 log("Periodic Task '" + task->name + "' (ID:" + std::to_string(task->id) + ") scheduled to run at tick " + std::to_string(current_tick) + ".");
                 unblockTask(task); // Move to READY state
@@ -829,21 +837,56 @@ void RTOSKernel::scheduler() {
                       ready_queue.end());
     sortReadyQueue(); // Ensure it's sorted after potential removals
 
-    if (ready_queue.empty()) {
-        log("No tasks are ready to run. Scheduler is idle.");
-        current_task = nullptr; // No task running
-        return;
-    }
+    TCB* next_task = nullptr;
 
-    // Select the highest priority task (first in sorted ready_queue)
-    TCB* next_task = ready_queue.front();
+    if (!ready_queue.empty()) {
+        // Select the highest priority task (first in sorted ready_queue)
+        next_task = ready_queue.front();
+    } else {
+        // If no other tasks are ready, run the Idle Task (which is always task ID 0)
+        next_task = findTaskById(0); // Assuming Idle Task is always the first created (ID 0)
+        if (next_task == nullptr || next_task->name != "Idle Task") {
+            // Fallback for safety, though Idle Task should always be ID 0
+            for(TCB* task : all_tasks) {
+                if (task->name == "Idle Task") {
+                    next_task = task;
+                    break;
+                }
+            }
+        }
+        if (next_task != nullptr) {
+            // Ensure Idle Task is marked as READY if it somehow isn't
+            if (next_task->state != READY) {
+                next_task->state = READY;
+                // Add to ready queue if it's not there, then sort
+                bool found_in_ready = false;
+                for(TCB* t : ready_queue) {
+                    if (t == next_task) {
+                        found_in_ready = true;
+                        break;
+                    }
+                }
+                if (!found_in_ready) {
+                    ready_queue.push_back(next_task);
+                    sortReadyQueue();
+                }
+            }
+            log("No other tasks are ready. Selecting Idle Task.");
+        } else {
+            log("ERROR: No tasks available, and Idle Task not found!");
+            return; // Critical error, no task to run
+        }
+    }
 
     // Perform a context switch if no task is running, or if the current task is not the highest priority
     // or if the current task has changed state (e.g., became blocked/delayed)
     if (current_task == nullptr || current_task->state != RUNNING || current_task != next_task) {
         contextSwitch(next_task);
     } else {
-        log("Current task ('" + current_task->name + "') continues execution.");
+        // Only log if the current task is NOT the idle task to avoid spamming
+        if (current_task->name != "Idle Task") {
+            log("Current task ('" + current_task->name + "') continues execution.");
+        }
     }
 }
 
@@ -851,14 +894,20 @@ void RTOSKernel::scheduler() {
 void RTOSKernel::contextSwitch(TCB* next_task) {
     if (current_task != nullptr && current_task->state == RUNNING) {
         // Change state of previous task to READY if it was running and not blocked/delayed
-        current_task->state = READY;
-        log("Context switch: '" + current_task->name + "' -> READY.");
+        // And it's not the idle task (idle task doesn't get put back in ready queue like others)
+        if (current_task->name != "Idle Task") {
+            current_task->state = READY;
+            log("Context switch: '" + current_task->name + "' -> READY.");
+        }
     }
 
     // Set the new task as current and change its state to RUNNING
     current_task = next_task;
     current_task->state = RUNNING;
-    log("Context switch: '" + current_task->name + "' -> RUNNING.");
+    // Only log if the current task is NOT the idle task to avoid spamming
+    if (current_task->name != "Idle Task") {
+        log("Context switch: '" + current_task->name + "' -> RUNNING.");
+    }
 }
 
 // Start the RTOS simulation
@@ -867,7 +916,7 @@ void RTOSKernel::startScheduler() {
 
     // Main simulation loop. In a real RTOS, this would be an infinite loop,
     // with scheduler called by timers/interrupts.
-    int simulation_max_ticks = 100; // Simulate for 100 ticks to see timers/periodic tasks in action
+    int simulation_max_ticks = 100; // Simulate for 100 ticks
     for (int i = 0; i < simulation_max_ticks; ++i) {
         log("\n--- Simulation Cycle (Tick " + std::to_string(current_tick) + ") ---");
         handleTick(); // Increment tick and handle delayed/periodic tasks/timers
@@ -875,12 +924,15 @@ void RTOSKernel::startScheduler() {
 
         if (current_task != nullptr && current_task->state == RUNNING) {
             // Execute the selected task's function
-            log("Executing task '" + current_task->name + "'...");
+            if (current_task->name != "Idle Task") { // Only log execution for non-idle tasks
+                log("Executing task '" + current_task->name + "'...");
+            }
             current_task->execute(); 
             
             // If the task is still running (didn't block or delay itself), re-queue it
             // This simulates a time slice ending and the task being put back into the ready queue
-            if (current_task->state == RUNNING) { 
+            // This applies to non-idle tasks. Idle task remains at the bottom.
+            if (current_task->state == RUNNING && current_task->name != "Idle Task") { 
                 // Find current_task in ready_queue (it should be at front if it was just run)
                 // Use std::remove to efficiently remove and then erase
                 auto it = std::remove(ready_queue.begin(), ready_queue.end(), current_task);
